@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  OPTIONAL LaunchAgent template for background orchestration.
+
+  Install this instead of keeping the daemon a child of the Dock app:
+    1. launchd does NOT expand shell variables — replace every literal $HOME
+       below with your absolute home directory first, e.g.:
+         sed "s|\$HOME|$HOME|g" com.akiostudio.orchestrator.plist \
+           > ~/Library/LaunchAgents/com.akiostudio.orchestrator.plist
+    2. launchctl bootstrap gui/$(id -u) \
+         ~/Library/LaunchAgents/com.akiostudio.orchestrator.plist
+  Remove with:
+       launchctl bootout gui/$(id -u)/com.akiostudio.orchestrator
+
+  The venv path assumes the app has launched at least once (the launcher
+  bootstraps it under Application Support — mutable state stays outside the
+  signed bundle, audit A8). KeepAlive is false: the daemon manages its own
+  lifecycle; launchd only starts it at login.
+
+  If build_mac_app.sh fell back to ~/Applications (non-admin install), also
+  replace the /Applications path in ProgramArguments with
+  $HOME/Applications/AkioStudio.app/... during the same sed step.
+
+  EnvironmentVariables mirrors the Dock launcher: launchd starts agents with
+  a minimal environment, so without this block the daemon would run with no
+  Homebrew PATH and none of the audited OLLAMA_*/MPS settings.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.akiostudio.orchestrator</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$HOME/Library/Application Support/AkioStudio/venv/bin/python</string>
+    <string>/Applications/AkioStudio.app/Contents/Resources/main.py</string>
+    <string>--daemon</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>AKIO_OLLAMA_BIN</key>
+    <string>/opt/homebrew/bin/ollama</string>
+    <key>OLLAMA_MAX_LOADED_MODELS</key>
+    <string>1</string>
+    <key>OLLAMA_NUM_PARALLEL</key>
+    <string>1</string>
+    <key>OLLAMA_FLASH_ATTENTION</key>
+    <string>1</string>
+    <key>OLLAMA_KV_CACHE_TYPE</key>
+    <string>q8_0</string>
+    <key>PYTORCH_ENABLE_MPS_FALLBACK</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>$HOME/Library/Application Support/AkioStudio/logs/orchestrator.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>$HOME/Library/Application Support/AkioStudio/logs/orchestrator.err.log</string>
+</dict>
+</plist>

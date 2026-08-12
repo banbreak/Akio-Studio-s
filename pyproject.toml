@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "akio-studio"
+version = "1.0.0"
+description = "Data-driven, audience-reinforced local anime studio engine for Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = [
+    # >=3.4: node_link_data/node_link_graph grew the explicit edges= keyword
+    # the lore graph passes.
+    "networkx>=3.4",
+]
+
+[project.optional-dependencies]
+# The orchestrator itself stays torch-free; install this extra only inside a
+# worker venv that actually runs MPS inference.
+mps = ["torch>=2.1"]
+neo4j = ["neo4j>=5.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4"]
+
+[tool.setuptools]
+packages = ["akio_studio"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

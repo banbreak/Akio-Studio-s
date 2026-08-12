@@ -1,0 +1,4 @@
+# Orchestrator venv only. torch / ComfyUI / Ollama run in their OWN server
+# processes and are never installed here (audit B3/M1): importing torch into
+# the orchestrator would itself consume the unified memory it is gating.
+networkx>=3.4
