@@ -25,6 +25,9 @@ coordinator gates and purges over their HTTP APIs.
 | `akio_studio/lore_graph_agent.py` | Canon lore graph (`MultiDiGraph` + atomic JSON) and the writers'-room persona chain |
 | `akio_studio/pool_coordinator.py` | Stage ledger for the unified-memory pool, Ollama/ComfyUI purge, DPO feedback logger |
 | `akio_studio/cloud_video.py` | Remote GPU video stage — submit/poll/download with idempotent submits, cost ceiling, and cancel-on-abort |
+| `akio_studio/runpod_transport.py` | RunPod Serverless adapter (canonical contract → `/run`, `/status`, `/cancel`) |
+| `runpod_worker/` | Deployable worker image: `handler.py`, `Dockerfile`, `requirements.txt` |
+| `scripts/runpod_setup.py` | Endpoint config check, health probe, paid smoke test, credential file, reconciliation |
 | `akio_studio/actor_sdk_exporter.py` | Portable `.synthetic_actor` bundles with streamed SHA-256 manifests |
 | `akio_studio/file_tree_manager.py` | Production directory layout + atomic asset metadata |
 | `main.py` | Composition layer — the only place the six modules meet; runnable demo |
@@ -74,6 +77,70 @@ cloud GPU (concurrent, ~0.2 GiB local for the HTTP client):
 and refuses (or auto-evicts before) any load that would exceed the usable
 budget. `Stage.VIDEO_DIFFUSION` is exempt while `video_backend == "cloud"`:
 it holds no local weights, so it neither evicts nor waits for local work.
+
+### RunPod setup
+
+The default provider is RunPod Serverless. Standing up an endpoint is four
+steps; only the first needs the RunPod console.
+
+**1. Build and push the worker image**
+
+```bash
+docker build -t <registry>/akio-video-worker:1.0.0 runpod_worker/
+docker push <registry>/akio-video-worker:1.0.0
+```
+
+Weights are deliberately *not* baked into the image — a 14B checkpoint would
+make a ~60 GB image and a punishing cold start.
+
+**2. Create the endpoint (RunPod console)**
+
+* **Serverless → New Endpoint**, container image = the tag you just pushed.
+* GPU: 48 GB class (A40 / L40S) for `Wan2.2-T2V-A14B`; 24 GB (A5000 / 4090)
+  is enough for the 5B/1.3B variants.
+* **Attach a network volume** and set `AKIO_MODEL_CACHE=/runpod-volume/models`
+  so weights download once, not per worker.
+* Container disk ≥ 20 GB; set **idle timeout** low (5–10 s) — idle workers
+  bill.
+* Optional: set `AKIO_S3_BUCKET` (+ `AKIO_S3_ENDPOINT`, `AKIO_S3_REGION`) to
+  return presigned URLs instead of inline base64. Recommended for anything
+  longer than a few seconds — base64 inflates the payload ~33% and RunPod caps
+  response size.
+
+**3. Point the studio at it**
+
+```bash
+export AKIO_RUNPOD_ENDPOINT_ID="<id from the endpoint page>"
+export RUNPOD_API_KEY="<Settings → API Keys>"
+```
+
+Set `runpod_gpu_cost_per_hour` in `CloudVideoConfig` to the rate you are
+actually paying — RunPod reports milliseconds, not dollars, so the cost
+ceiling is derived from that rate and cannot protect you if it is wrong.
+
+**4. Verify**
+
+```bash
+python scripts/runpod_setup.py --check   # config + /health, spends nothing
+python scripts/runpod_setup.py --smoke   # one real 33-frame render (~$0.02)
+python scripts/runpod_setup.py --write-env-file   # cloud.env, chmod 600, for the .app
+python scripts/runpod_setup.py --reconcile        # list ambiguous submissions
+```
+
+#### RunPod-specific caveats
+
+* **No idempotency keys.** RunPod ignores `Idempotency-Key`, so submissions
+  are attempted **exactly once** and never retried — a retry could start a
+  second billable job. A submit that fails mid-flight raises
+  `CloudSubmitAmbiguousError` (distinct from a plain failure: the job may be
+  running *right now*) and is journaled to
+  `~/Library/Application Support/AkioStudio/runpod_submits.jsonl`. Run
+  `--reconcile`, then check the endpoint's Requests tab.
+* **No cost field.** Cost is derived from `executionTime` + `delayTime`
+  against your configured rate; while a job is in flight it is *estimated*
+  from elapsed wall-clock so a runaway job still trips the ceiling.
+* **Cold starts.** The first render after scale-to-zero loads the checkpoint
+  from the network volume. Keep one worker warm if latency matters; it bills.
 
 ### Cloud video stage
 

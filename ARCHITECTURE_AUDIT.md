@@ -321,3 +321,34 @@ trades a memory problem for a money-and-network problem:
 **What did not change.** Ollama and ComfyUI orchestration, the purge
 semantics, and the exclusive local rotation are untouched — this is strictly
 the removal of one stage from the local pool, not a redesign of it.
+
+### A10.1 — RunPod as the concrete provider
+
+The A10 change left the provider abstract. RunPod Serverless is now the
+default, implemented as an adapter (`akio_studio/runpod_transport.py`) rather
+than by changing the pipeline — the renderer still speaks only the canonical
+job contract.
+
+Two RunPod realities forced design decisions rather than configuration:
+
+**No idempotency keys.** The A10 table listed "retried submit double-bills →
+`Idempotency-Key`" as the mitigation. RunPod does not honour that header, so
+the mitigation does not exist there. Rather than pretend otherwise, the
+adapter sets `retries_submits = False`, forwards no `Idempotency-Key` (sending
+one would imply a protection that is absent), journals every attempt, and
+raises the new `CloudSubmitAmbiguousError` when a submit fails in flight —
+a distinct type because the remedy differs: the job may be running and billing,
+so it must be reconciled against the console, not blindly resubmitted.
+
+**No cost field.** `max_cost_usd` would have been a silent no-op on RunPod,
+which reports `executionTime`/`delayTime` in milliseconds. The adapter derives
+dollars from those against `runpod_gpu_cost_per_hour`, and estimates from
+elapsed wall-clock while a job is still in flight so a runaway job trips the
+ceiling before it finishes. A rate of 0 disables the ceiling *explicitly* and
+the setup script warns about it, rather than the guard quietly doing nothing.
+
+Supporting pieces: `runpod_worker/` (handler + Dockerfile) is the deployable
+endpoint image — it returns a SHA-256 with every render so the client's
+truncation check has something to verify against — and `scripts/runpod_setup.py`
+verifies configuration, endpoint health, and (opt-in, with confirmation, since
+it spends money) one real render.

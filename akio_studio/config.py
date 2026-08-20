@@ -219,6 +219,17 @@ class CloudVideoConfig:
     #: Cloud jobs run in parallel — this is remote capacity, not local memory.
     max_concurrent_jobs: int = 3
 
+    #: ``"runpod"`` uses the RunPod Serverless adapter; ``"generic"`` speaks
+    #: the canonical contract directly; ``"mock"`` forces the offline stub.
+    provider: str = "runpod"
+    #: RunPod endpoint id (the id on the endpoint's page in the console).
+    runpod_endpoint_id: str = ""
+    runpod_endpoint_id_env_var: str = "AKIO_RUNPOD_ENDPOINT_ID"
+    #: USD/hour for the endpoint's GPU. RunPod reports milliseconds, not
+    #: dollars, so without a rate the ``max_cost_usd`` ceiling cannot trip.
+    #: Default is an A40/L40S-class list price; set it to your actual rate.
+    runpod_gpu_cost_per_hour: float = 0.79
+
     def resolve_endpoint(self) -> str:
         """Effective endpoint: environment override wins over the config value."""
         return os.environ.get(self.endpoint_env_var, "") or self.endpoint
@@ -227,9 +238,21 @@ class CloudVideoConfig:
         """Bearer token from the environment, or ``None`` when unset."""
         return os.environ.get(self.token_env_var) or None
 
+    def resolve_runpod_endpoint_id(self) -> str:
+        """RunPod endpoint id from the environment, else the config value."""
+        return (
+            os.environ.get(self.runpod_endpoint_id_env_var, "")
+            or self.runpod_endpoint_id
+        )
+
     @property
     def is_configured(self) -> bool:
-        """True when both an endpoint and a credential are available."""
+        """True when this provider has everything it needs to render."""
+        if self.provider == "mock":
+            return False
+        token = bool(self.resolve_token() or os.environ.get("RUNPOD_API_KEY"))
+        if self.provider == "runpod":
+            return bool(self.resolve_runpod_endpoint_id()) and token
         return bool(self.resolve_endpoint()) and bool(self.resolve_token())
 
 

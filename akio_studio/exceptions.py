@@ -63,6 +63,15 @@ class CloudJobFailedError(CloudRenderError):
     """Raised when a cloud render job reaches a terminal failure state."""
 
 
+class CloudSubmitAmbiguousError(CloudRenderError):
+    """Raised when a submission failed in flight and may still have started.
+
+    Distinct from a plain :class:`CloudRenderError` because the remedy is
+    different: the job may be running and billing right now, so the operator
+    must reconcile against the provider console rather than simply resubmit.
+    """
+
+
 class CloudTimeoutError(CloudRenderError):
     """Raised when a cloud render job outlives its wall-clock budget."""
 

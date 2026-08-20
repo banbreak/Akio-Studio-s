@@ -10,9 +10,11 @@ import pytest
 
 from akio_studio.cloud_video import (
     CloudVideoRenderer,
+    HttpCloudTransport,
     JobStatus,
     MockCloudTransport,
     VideoRenderRequest,
+    build_transport,
 )
 from akio_studio.config import CloudVideoConfig, StudioConfig
 from akio_studio.exceptions import (
@@ -186,7 +188,7 @@ async def test_task_cancellation_cancels_the_job(tmp_path) -> None:
 async def test_plaintext_endpoint_is_refused(monkeypatch) -> None:
     monkeypatch.setenv("AKIO_CLOUD_VIDEO_ENDPOINT", "http://gpu.example.com/v1")
     monkeypatch.setenv("AKIO_CLOUD_VIDEO_TOKEN", "secret")
-    renderer = CloudVideoRenderer(_config())  # real transport
+    renderer = CloudVideoRenderer(_config(provider="generic"))  # real transport
     with pytest.raises(CloudAuthError, match="https"):
         await renderer.submit(_request())
 
@@ -194,9 +196,37 @@ async def test_plaintext_endpoint_is_refused(monkeypatch) -> None:
 async def test_missing_credentials_raise_before_any_request(monkeypatch) -> None:
     monkeypatch.delenv("AKIO_CLOUD_VIDEO_TOKEN", raising=False)
     monkeypatch.setenv("AKIO_CLOUD_VIDEO_ENDPOINT", "https://gpu.example.com/v1")
-    renderer = CloudVideoRenderer(_config())
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    # Explicit real transport: the factory would otherwise hand back the mock,
+    # which is the documented offline fallback (covered separately below).
+    renderer = CloudVideoRenderer(
+        _config(provider="generic"), transport=HttpCloudTransport()
+    )
     with pytest.raises(CloudAuthError):
         await renderer.submit(_request())
+
+
+def test_unconfigured_provider_falls_back_to_mock(monkeypatch) -> None:
+    """No credentials must mean 'render nothing, bill nothing' — not a crash."""
+    for var in (
+        "AKIO_CLOUD_VIDEO_TOKEN",
+        "AKIO_CLOUD_VIDEO_ENDPOINT",
+        "AKIO_RUNPOD_ENDPOINT_ID",
+        "RUNPOD_API_KEY",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    assert isinstance(build_transport(_config()), MockCloudTransport)
+
+
+def test_configured_runpod_selects_the_runpod_adapter(monkeypatch) -> None:
+    from akio_studio.runpod_transport import RunPodTransport
+
+    monkeypatch.setenv("AKIO_RUNPOD_ENDPOINT_ID", "abc123")
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-secret")
+    transport = build_transport(_config(provider="runpod"))
+    assert isinstance(transport, RunPodTransport)
+    # RunPod cannot deduplicate submissions, so they must not be retried.
+    assert transport.retries_submits is False
 
 
 async def test_auth_failure_is_not_retried() -> None:

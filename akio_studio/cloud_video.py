@@ -54,6 +54,7 @@ from akio_studio.exceptions import (
 
 __all__ = [
     "CloudTransport",
+    "build_transport",
     "CloudVideoRenderer",
     "HttpCloudTransport",
     "JobStatus",
@@ -102,6 +103,7 @@ class JobStatus(StrEnum):
             "failed": cls.FAILED,
             "cancelled": cls.CANCELED,
             "aborted": cls.CANCELED,
+            "timed_out": cls.FAILED,
             "pending": cls.QUEUED,
             "in_queue": cls.QUEUED,
             "processing": cls.RUNNING,
@@ -355,6 +357,22 @@ class MockCloudTransport:
         return self.payload_bytes
 
 
+def build_transport(config: StudioConfig) -> CloudTransport:
+    """Transport for the configured provider.
+
+    ``runpod`` is imported lazily: the adapter imports this module, so a
+    top-level import here would be circular.
+    """
+    provider = config.cloud_video.provider
+    if provider == "mock" or not config.cloud_video.is_configured:
+        return MockCloudTransport()
+    if provider == "runpod":
+        from akio_studio.runpod_transport import RunPodTransport
+
+        return RunPodTransport(config.cloud_video)
+    return HttpCloudTransport()
+
+
 class CloudVideoRenderer:
     """Submits shots to a remote GPU, waits, verifies, and stores the result.
 
@@ -371,8 +389,19 @@ class CloudVideoRenderer:
         """Create a renderer bound to ``config``'s cloud settings."""
         self._config = config if config is not None else StudioConfig()
         self._cloud: CloudVideoConfig = self._config.cloud_video
-        self._transport: CloudTransport = transport or HttpCloudTransport()
+        self._transport: CloudTransport = (
+            transport if transport is not None else build_transport(self._config)
+        )
         self._is_mock = isinstance(self._transport, MockCloudTransport)
+        #: A transport may own its addressing (``canonical_base``) and its
+        #: credential (``handles_auth``) — the RunPod adapter does both, since
+        #: it builds URLs from an endpoint id rather than a base URL.
+        self._transport_handles_auth = bool(
+            getattr(self._transport, "handles_auth", False)
+        )
+        #: Providers without idempotency keys (RunPod) must not have their
+        #: submissions retried — a retry could start a second billable job.
+        self._retries_submits = bool(getattr(self._transport, "retries_submits", True))
 
     @property
     def model(self) -> str:
@@ -389,6 +418,11 @@ class CloudVideoRenderer:
         """
         if self._is_mock:
             return (self._cloud.resolve_endpoint() or "https://mock.invalid/v1").rstrip("/")
+        # Evaluated lazily: a transport that derives its base from an endpoint
+        # id reports a configuration error here rather than at construction.
+        transport_base = getattr(self._transport, "canonical_base", None)
+        if transport_base:
+            return str(transport_base).rstrip("/")
         endpoint = self._cloud.resolve_endpoint()
         if not endpoint:
             raise CloudAuthError(
@@ -410,7 +444,7 @@ class CloudVideoRenderer:
         token = self._cloud.resolve_token()
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        elif not self._is_mock:
+        elif not self._is_mock and not self._transport_handles_auth:
             raise CloudAuthError(
                 f"no cloud credential; set ${self._cloud.token_env_var}"
             )
@@ -426,14 +460,18 @@ class CloudVideoRenderer:
         headers: dict[str, str],
         timeout: float,
         what: str,
+        retryable: bool = True,
     ) -> dict[str, Any]:
         """Issue a request, retrying transient failures with jittered backoff.
 
-        Retried on connection errors and 5xx/429 only. 401/403 fail fast —
-        a bad credential will not fix itself, and retrying wastes the budget.
+        Retried on connection errors and 5xx/429 only. 401/403 fail fast — a
+        bad credential will not fix itself, and retrying wastes the budget.
+        ``retryable=False`` disables retries entirely, which is how
+        submissions behave on a provider that cannot deduplicate them.
         """
         last_error = ""
-        for attempt in range(1, self._cloud.max_attempts + 1):
+        attempts = self._cloud.max_attempts if retryable else 1
+        for attempt in range(1, attempts + 1):
             try:
                 status, body = await self._transport.request(
                     method, url, payload, headers, timeout
@@ -452,20 +490,18 @@ class CloudVideoRenderer:
                 last_error = f"HTTP {status}: {str(body)[:200]}"
                 if status < 500 and status != 429:
                     raise CloudRenderError(f"{what} failed — {last_error}")
-            if attempt < self._cloud.max_attempts:
+            if attempt < attempts:
                 backoff = min(2.0 ** (attempt - 1), 15.0) * (1.0 + random.random() * 0.25)
                 logger.warning(
                     "%s attempt %d/%d failed (%s); retrying in %.1fs",
                     what,
                     attempt,
-                    self._cloud.max_attempts,
+                    attempts,
                     last_error,
                     backoff,
                 )
                 await asyncio.sleep(backoff)
-        raise CloudRenderError(
-            f"{what} failed after {self._cloud.max_attempts} attempts — {last_error}"
-        )
+        raise CloudRenderError(f"{what} failed after {attempts} attempt(s) — {last_error}")
 
     # ---------------------------------------------------------- job control
 
@@ -485,6 +521,7 @@ class CloudVideoRenderer:
             self._headers(idempotency_key=key),
             self._cloud.submit_timeout_s,
             f"submit of shot {request.shot_id!r}",
+            retryable=self._retries_submits,
         )
         job_id = body.get("job_id") or body.get("id")
         if not isinstance(job_id, str) or not job_id:
