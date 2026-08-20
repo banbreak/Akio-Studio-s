@@ -111,6 +111,15 @@ export OLLAMA_FLASH_ATTENTION=1
 export OLLAMA_KV_CACHE_TYPE=q8_0
 # CPU-fallback escape hatch for unimplemented MPS ops — NOT an "MPS enabler".
 export PYTORCH_ENABLE_MPS_FALLBACK=1
+
+# Cloud video stage (audit A10). The credential is READ from the user's
+# environment or a 0600 env file — never baked into the signed bundle, where
+# it would be world-readable inside /Applications.
+AKIO_ENV_FILE="$SUPPORT/cloud.env"
+if [ -f "$AKIO_ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  set -a; . "$AKIO_ENV_FILE"; set +a
+fi
 AKIO_OLLAMA_BIN="$(command -v ollama || echo /opt/homebrew/bin/ollama)"
 export AKIO_OLLAMA_BIN
 

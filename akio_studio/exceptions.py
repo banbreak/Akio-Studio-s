@@ -49,3 +49,23 @@ class MissingAssetError(ActorExportError):
 
 class FileTreeError(AkioStudioError):
     """Raised when the production directory tree cannot be created or written."""
+
+
+class CloudRenderError(AkioStudioError):
+    """Base class for remote (cloud GPU) rendering failures."""
+
+
+class CloudAuthError(CloudRenderError):
+    """Raised when the cloud endpoint or its credential is missing or rejected."""
+
+
+class CloudJobFailedError(CloudRenderError):
+    """Raised when a cloud render job reaches a terminal failure state."""
+
+
+class CloudTimeoutError(CloudRenderError):
+    """Raised when a cloud render job outlives its wall-clock budget."""
+
+
+class CloudBudgetExceededError(CloudRenderError):
+    """Raised when a cloud render job's reported cost exceeds the budget."""

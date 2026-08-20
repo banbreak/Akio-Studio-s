@@ -268,3 +268,56 @@ a verified stage ledger, which is both correct and *more* efficient: models
 load exactly once per stage instead of once per call, and the orchestrator
 itself stays torch-free and lightweight (~50 MB).
 
+
+---
+
+## A10. Video stage moved to a cloud GPU
+
+*Follow-up change, made after the audit's verdict flagged the video stage as
+the remaining hardware risk.*
+
+**Problem.** Finding A2 established that no WAN-class 14B checkpoint can run
+on this machine: ~28 GiB in fp16 against a 24 GiB unified pool shared with
+macOS. The implemented workaround was a ~1.3B local fallback — it fits, but it
+is a materially smaller model than the architecture's quality target, and even
+then it had to take its turn in the exclusive residency rotation, evicting the
+LLM or image stack to render frames.
+
+**Change.** The video stage now runs on a rented GPU by default
+(`StudioConfig.video_backend == "cloud"`), implemented in
+`akio_studio/cloud_video.py`. `video_backend="local"` keeps the old on-device
+path for offline work.
+
+**Consequences, in order of significance:**
+
+1. **Model class.** The remote checkpoint is a 14B-class model
+   (`CloudVideoConfig.model`), which the local machine could not host at any
+   quantization alongside the rest of the stack.
+2. **Local pressure removed.** The stage keeps only an HTTP client resident
+   (~0.2 GiB, `MODEL_FOOTPRINTS_GIB["video_client"]`). `Stage.VIDEO_DIFFUSION`
+   is therefore *exempt from residency* when remote: `_is_remote()` short-
+   circuits acquisition, so it neither evicts a local stage nor holds the
+   coordinator lock. Local work continues while frames render.
+3. **Concurrency.** Seed variants for a shot render in parallel
+   (`render_batch`, bounded by `max_concurrent_jobs`) — remote capacity is not
+   the scarce local resource, so a seed sweep costs wall-clock once rather
+   than once per seed. This directly improves the DPO loop, which needs
+   multiple same-conditioning variants (finding A4) to form pairs at all.
+
+**Risks this introduces, and how they are handled.** Moving a stage off-device
+trades a memory problem for a money-and-network problem:
+
+| Risk | Mitigation |
+| --- | --- |
+| Retried submit double-bills | `Idempotency-Key` over the canonical request; a compliant provider collapses the duplicate |
+| Runaway job cost | `max_cost_usd` ceiling — the job is *cancelled remotely* on breach |
+| Hung/abandoned job keeps billing | `max_wait_s` budget and `CancelledError` handling both issue a remote cancel |
+| Credential leakage | HTTPS enforced (loopback exempt); token read from env only, never logged, never written to metadata or the `.app` bundle |
+| Wasted spend on invalid params | Quality gate validated client-side *before* submission |
+| Truncated download treated as a finished shot | SHA-256 verified against the provider's digest; atomic write |
+| Bad credential burning retries | 401/403 fail fast; only 5xx/429/connection errors back off and retry |
+| Provider status dialects | `JobStatus.parse` maps aliases and treats unknown states as *running*, so a new in-flight state never aborts a live job |
+
+**What did not change.** Ollama and ComfyUI orchestration, the purge
+semantics, and the exclusive local rotation are untouched — this is strictly
+the removal of one stage from the local pool, not a redesign of it.

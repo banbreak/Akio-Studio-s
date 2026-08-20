@@ -24,6 +24,7 @@ coordinator gates and purges over their HTTP APIs.
 | `akio_studio/metrics_engine.py` | Metrics ingestion, R2E scoring, greenlight validation, fan-theory mining, greenlight webhook |
 | `akio_studio/lore_graph_agent.py` | Canon lore graph (`MultiDiGraph` + atomic JSON) and the writers'-room persona chain |
 | `akio_studio/pool_coordinator.py` | Stage ledger for the unified-memory pool, Ollama/ComfyUI purge, DPO feedback logger |
+| `akio_studio/cloud_video.py` | Remote GPU video stage — submit/poll/download with idempotent submits, cost ceiling, and cancel-on-abort |
 | `akio_studio/actor_sdk_exporter.py` | Portable `.synthetic_actor` bundles with streamed SHA-256 manifests |
 | `akio_studio/file_tree_manager.py` | Production directory layout + atomic asset metadata |
 | `main.py` | Composition layer — the only place the six modules meet; runnable demo |
@@ -55,18 +56,57 @@ macOS launcher and currently run the same demo pipeline.
 
 ## Memory stages
 
-The whole stack can never co-reside in the 24 GiB pool, so residency is a
-strictly sequential, verified rotation:
+The local stack can never co-reside in the 24 GiB pool, so *local* residency
+is a strictly sequential, verified rotation — while the video stage runs
+off-device and therefore overlaps it:
 
 ```
-LLM (~10 GiB) -> purge Ollama (keep_alive:0, verified via /api/ps)
-             -> IMAGE (~10 GiB) -> purge ComfyUI (POST /free)
-             -> VIDEO (~14 GiB) -> purge ComfyUI (POST /free)
-             -> EDIT (~8 GiB working set)
+local pool (exclusive, ~18 GiB usable):
+  LLM (~10 GiB) -> purge Ollama (keep_alive:0, verified via /api/ps)
+               -> IMAGE (~10 GiB) -> purge ComfyUI (POST /free)
+               -> EDIT (~8 GiB working set)
+
+cloud GPU (concurrent, ~0.2 GiB local for the HTTP client):
+  VIDEO -> submit N seed variants -> poll -> download + verify -> store
 ```
 
-`LocalPoolCoordinator` enforces one-resident-stage-at-a-time and refuses (or
-auto-evicts before) any load that would exceed the usable budget.
+`LocalPoolCoordinator` enforces one-resident-stage-at-a-time for local stages
+and refuses (or auto-evicts before) any load that would exceed the usable
+budget. `Stage.VIDEO_DIFFUSION` is exempt while `video_backend == "cloud"`:
+it holds no local weights, so it neither evicts nor waits for local work.
+
+### Cloud video stage
+
+A WAN-class 14B checkpoint is ~28 GiB in fp16 — larger than the entire
+unified pool — so video renders remotely by default. Configure it with two
+environment variables (never committed, never baked into the `.app`):
+
+```bash
+export AKIO_CLOUD_VIDEO_ENDPOINT="https://your-gpu-provider.example/v1"
+export AKIO_CLOUD_VIDEO_TOKEN="..."      # bearer token, HTTPS enforced
+```
+
+On macOS the launcher also sources `~/Library/Application Support/AkioStudio/cloud.env`
+(keep it `chmod 600`). With neither set, `main.py` renders through an
+in-process mock transport so the demo runs offline and bills nothing.
+
+The endpoint contract is provider-agnostic REST — `POST /jobs`,
+`GET /jobs/{id}`, `POST /jobs/{id}/cancel`. For a provider that speaks a
+different dialect, pass a custom `transport` to `CloudVideoRenderer` rather
+than changing the pipeline.
+
+Spend controls, because a rented GPU bills by the second:
+
+* submissions carry an `Idempotency-Key` over the request contents, so a
+  retried POST after a dropped connection cannot start a second billable
+  render;
+* `max_cost_usd` cancels a job that reports a cost above the ceiling;
+* `max_wait_s` cancels a job that outlives its budget — never abandons it;
+* task cancellation propagates to a remote cancel;
+* auth failures (401/403) fail fast instead of burning retries;
+* out-of-gate parameters are rejected client-side, before anything is billed;
+* downloads are checksum-verified, so a truncated fetch is never mistaken
+  for a finished shot.
 
 ## What changed vs. the PDF spec
 

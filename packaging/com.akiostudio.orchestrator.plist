@@ -52,6 +52,11 @@
     <string>q8_0</string>
     <key>PYTORCH_ENABLE_MPS_FALLBACK</key>
     <string>1</string>
+    <!-- Cloud video endpoint. The TOKEN is deliberately absent: put it in
+         ~/Library/Application Support/AkioStudio/cloud.env (chmod 600), which
+         the launcher sources. A LaunchAgent plist is world-readable. -->
+    <key>AKIO_CLOUD_VIDEO_ENDPOINT</key>
+    <string></string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

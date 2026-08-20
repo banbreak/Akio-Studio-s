@@ -5,7 +5,9 @@ place they are wired together (metrics engine -> lore graph -> writers' room
 -> pool coordinator -> DPO logger -> file tree -> actor exporter). It runs a
 complete concept-to-bundle demo that is **green with no Ollama and no ComfyUI
 running**: the LLM stage falls back to a deterministic offline stub script,
-and the purge step reports both servers as unreachable instead of failing.
+the video stage renders through a mock cloud transport when no GPU endpoint
+is configured, and the purge step reports both servers as unreachable instead
+of failing.
 
 Flags:
 
@@ -29,8 +31,17 @@ from typing import Any
 
 from akio_studio._io import atomic_write_bytes, atomic_write_json
 from akio_studio.actor_sdk_exporter import SyntheticActorSDKExporter
+from akio_studio.cloud_video import (
+    CloudVideoRenderer,
+    MockCloudTransport,
+    VideoRenderRequest,
+)
 from akio_studio.config import StudioConfig
-from akio_studio.exceptions import OllamaUnavailableError, WebhookDispatchError
+from akio_studio.exceptions import (
+    CloudRenderError,
+    OllamaUnavailableError,
+    WebhookDispatchError,
+)
 from akio_studio.file_tree_manager import ProductionFileTreeManager
 from akio_studio.lore_graph_agent import LoreGraphManager, WritersRoom
 from akio_studio.metrics_engine import MetricsIngestionEngine
@@ -76,19 +87,100 @@ def offline_stub_script(premise: str, top_theory: str) -> str:
     )
 
 
+async def render_shots_remotely(
+    config: StudioConfig,
+    coordinator: LocalPoolCoordinator,
+    tree: dict[str, Path],
+    script: str,
+) -> dict[str, Any]:
+    """Render the shot's seed variants on a cloud GPU (audit A10).
+
+    Two things make this stage different from every other one:
+
+    * It uses ``coordinator.stage(Stage.VIDEO_DIFFUSION)`` purely for
+      bookkeeping — because the backend is remote the coordinator grants it
+      without evicting anything, so local work could proceed in parallel.
+    * The variants render *concurrently*. Remote GPUs are the constraint that
+      the local 24 GiB pool is not, so seed sweeps cost wall-clock once
+      instead of once per seed.
+
+    Falls back to an in-process mock transport when no endpoint/credential is
+    configured, so the demo runs offline and spends nothing.
+    """
+    cloud = config.cloud_video
+    if cloud.is_configured:
+        renderer = CloudVideoRenderer(config)
+        logger.info(
+            "cloud video endpoint configured; rendering %s remotely", cloud.model
+        )
+    else:
+        renderer = CloudVideoRenderer(config, transport=MockCloudTransport())
+        logger.info(
+            "no cloud credentials (set $%s and $%s) — using the mock transport; "
+            "no GPU time is billed",
+            cloud.endpoint_env_var,
+            cloud.token_env_var,
+        )
+
+    shot_prompt = script.splitlines()[0] if script.strip() else PREMISE
+    prompt_hash = hashlib.sha256(f"{CONCEPT_ID}/shot012/{PREMISE}".encode()).hexdigest()[:16]
+    requests = [
+        VideoRenderRequest(
+            shot_id=f"shot012_seed{seed}.mp4",
+            prompt=f"{shot_prompt} — sakuga impact frame, heavy brush lines",
+            seed=seed,
+            prompt_hash=prompt_hash,
+            denoise=0.30,
+            num_frames=81,
+            extra={"concept_id": CONCEPT_ID},
+        )
+        for seed in (41, 77)
+    ]
+
+    dest = tree["master_16_9"]
+    async with coordinator.stage(Stage.VIDEO_DIFFUSION):
+        outcomes = await renderer.render_batch(requests, dest)
+
+    rendered = [o for o in outcomes if not isinstance(o, BaseException)]
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            if isinstance(outcome, CloudRenderError):
+                logger.error("a shot failed to render remotely: %s", outcome)
+            else:  # unexpected type — surface it rather than swallow it
+                raise outcome
+
+    manifest = renderer.render_manifest(rendered)
+    manifest_path = atomic_write_json(tree["metadata"] / "cloud_render.json", manifest)
+    logger.info(
+        "cloud render manifest: %s (%d/%d shots, $%.2f)",
+        manifest_path,
+        len(rendered),
+        len(requests),
+        manifest["total_cost_usd"],
+    )
+    return {
+        "backend": "cloud" if cloud.is_configured else "cloud (mock transport)",
+        "model": renderer.model,
+        "rendered": len(rendered),
+        "requested": len(requests),
+        "total_cost_usd": manifest["total_cost_usd"],
+        "manifest_path": manifest_path,
+    }
+
+
 async def run_demo(args: argparse.Namespace) -> dict[str, Any]:
     """Run the full demo pipeline; returns the final summary dictionary."""
     base_dir = Path(args.base_dir).resolve()
     config = StudioConfig(base_dir=base_dir)
 
     # ------------------------------------------------------------ a. file tree
-    logger.info("[1/9] Initializing production file tree under %s", base_dir)
+    logger.info("[1/10] Initializing production file tree under %s", base_dir)
     ftm = ProductionFileTreeManager(base_dir=base_dir)
     tree = ftm.initialize_concept_tree(CONCEPT_ID)
     logger.info("concept tree ready: %s", tree["root"])
 
     # --------------------------------------------------------------- b. metrics
-    logger.info("[2/9] Ingesting mock platform metrics for 3 posts")
+    logger.info("[2/10] Ingesting mock platform metrics for 3 posts")
     engine = MetricsIngestionEngine(config)
     posts = [
         engine.fetch_mock_platform_data(f"{CONCEPT_ID}-post-{index:02d}", CONCEPT_ID)
@@ -112,7 +204,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, Any]:
     top_theory = theories[0] if theories else "the masked mentor is a fox spirit"
 
     # ------------------------------------------------------------ c. lore graph
-    logger.info("[3/9] Building canon lore graph (persisted to lore_graph/)")
+    logger.info("[3/10] Building canon lore graph (persisted to lore_graph/)")
     lore = LoreGraphManager(persist_path=tree["lore_graph"] / "canon.json")
     lore.add_lore_entity(
         CONCEPT_ID,
@@ -144,7 +236,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     # ------------------------------------------------- d. LLM stage + writers' room
-    logger.info("[4/9] Acquiring LLM stage and drafting the episode script")
+    logger.info("[4/10] Acquiring LLM stage and drafting the episode script")
     coordinator = LocalPoolCoordinator(
         config=config, auto_evict=True, dpo_log_path=tree["logs"] / "dpo_feedback.jsonl"
     )
@@ -160,8 +252,12 @@ async def run_demo(args: argparse.Namespace) -> dict[str, Any]:
             script_source = "offline-stub"
     logger.info("script drafted via %s (%d chars)", script_source, len(script))
 
-    # --------------------------------------------------------- e. DPO feedback
-    logger.info("[5/9] Registering shot renders and logging DPO latent feedback")
+    # ---------------------------------------------------- e. cloud video stage
+    logger.info("[5/10] Rendering shot variants on the cloud GPU")
+    video_summary = await render_shots_remotely(config, coordinator, tree, script)
+
+    # --------------------------------------------------------- f. DPO feedback
+    logger.info("[6/10] Registering shot renders and logging DPO latent feedback")
     dpo = coordinator.dpo
     assert dpo is not None  # dpo_log_path was provided above
     quality_gate = config.quality_gate
@@ -188,8 +284,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, Any]:
     else:
         logger.warning("no DPO pair formed (unpaired rejection logged)")
 
-    # ------------------------------------------------------- f. asset metadata
-    logger.info("[6/9] Writing asset metadata with quality-gate parameters")
+    # ------------------------------------------------------- g. asset metadata
+    logger.info("[7/10] Writing asset metadata with quality-gate parameters")
     for asset_id, seed, retention in (
         ("shot012_seed41.mp4", 41, 0.83),
         ("shot012_seed77.mp4", 77, 0.41),
@@ -208,8 +304,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, Any]:
         )
         logger.info("metadata written: %s", path)
 
-    # --------------------------------------------------------- g. actor bundle
-    logger.info("[7/9] Exporting the ronin_kael .synthetic_actor bundle")
+    # --------------------------------------------------------- h. actor bundle
+    logger.info("[8/10] Exporting the ronin_kael .synthetic_actor bundle")
     staging = tree["actors"] / "_staging"
     lora_path = atomic_write_bytes(
         staging / "ronin_kael_identity.safetensors", b"AKIO-PLACEHOLDER-TENSOR\x00" * 256
@@ -242,14 +338,14 @@ async def run_demo(args: argparse.Namespace) -> dict[str, Any]:
         bundle_path.stat().st_size,
     )
 
-    # ----------------------------------------------------------- h. full purge
-    logger.info("[8/9] Purging the unified memory pool (servers may be absent)")
+    # ----------------------------------------------------------- i. full purge
+    logger.info("[9/10] Purging the unified memory pool (servers may be absent)")
     purge_report = await coordinator.purge_unified_memory_pool()
 
-    # -------------------------------------------------------------- i. webhook
+    # -------------------------------------------------------------- j. webhook
     webhook_status = "skipped (no --webhook-url)"
     if args.webhook_url:
-        logger.info("[9/9] Dispatching greenlight webhook to %s", args.webhook_url)
+        logger.info("[10/10] Dispatching greenlight webhook to %s", args.webhook_url)
         summary_payload: dict[str, object] = {
             "validated": validated,
             "posts_evaluated": len(posts),
@@ -265,7 +361,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, Any]:
             webhook_status = f"failed: {exc}"
             logger.warning("webhook dispatch failed: %s", exc)
     else:
-        logger.info("[9/9] No --webhook-url given — skipping greenlight webhook dispatch")
+        logger.info("[10/10] No --webhook-url given — skipping greenlight webhook dispatch")
 
     summary: dict[str, Any] = {
         "concept_id": CONCEPT_ID,
@@ -273,6 +369,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, Any]:
         "theories": theories,
         "script_source": script_source,
         "script_preview": script[:200],
+        "video": video_summary,
         "bundle_path": str(bundle_path),
         "bundle_bytes": bundle_path.stat().st_size,
         "dpo_pair_logged": pair is not None,
@@ -296,6 +393,12 @@ def _print_summary(summary: dict[str, Any]) -> None:
         print(f"  {rank}. {theory}")
     print(f"script source: {summary['script_source']}")
     print(f"script preview (200 chars): {summary['script_preview']!r}")
+    video = summary["video"]
+    print(
+        f"video stage: {video['backend']} — {video['model']}, "
+        f"{video['rendered']}/{video['requested']} shots, "
+        f"${video['total_cost_usd']:.2f}"
+    )
     print(f"actor bundle: {summary['bundle_path']} ({summary['bundle_bytes']} bytes)")
     print(f"dpo pair logged: {summary['dpo_pair_logged']} -> {summary['dpo_log_path']}")
     print(f"purge report: {summary['purge_report']}")

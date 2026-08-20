@@ -9,6 +9,7 @@ limits.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
@@ -26,13 +27,19 @@ SYSTEM_RESERVED_GIB: float = 6.0
 
 #: Estimated resident footprints of each loadable model stage, in GiB.
 #: qwen2.5-coder:14b at Q4_K_M weighs ~9 GiB plus KV cache; an SDXL-class
-#: anime checkpoint with IP-Adapter/ControlNet stack ~10 GiB; a WAN-class
-#: video model ~14 GiB. LLM + either diffusion stage cannot co-reside within
-#: the ~18 GiB usable pool, which is why stages are gated sequentially.
+#: anime checkpoint with IP-Adapter/ControlNet stack ~10 GiB. LLM + image
+#: diffusion cannot co-reside within the ~18 GiB usable pool, which is why
+#: local stages are gated sequentially.
 MODEL_FOOTPRINTS_GIB: dict[str, float] = {
     "llm": 10.0,
     "image_diffusion": 10.0,
+    # Local video fallback only. A WAN-class video model needs ~14 GiB, which
+    # is why the video stage runs on a cloud GPU by default (see
+    # CloudVideoConfig): a 14B-class checkpoint never fits this machine at all.
     "video_diffusion": 14.0,
+    # The default remote video stage keeps nothing local but an HTTP client,
+    # so it can overlap with local work instead of evicting it.
+    "video_client": 0.2,
     # After Effects / aerender working set for the re-frame + render stage —
     # no model weights, but 16-bpc frame caches are far from free.
     "edit": 8.0,
@@ -166,6 +173,67 @@ class ComfyQualityGate:
 
 
 @dataclass(frozen=True)
+class CloudVideoConfig:
+    """Where and how the video stage renders on a remote GPU.
+
+    The video stage is the one part of the pipeline that cannot run on the
+    target machine: a WAN-class 14B checkpoint is ~28 GiB in fp16, larger than
+    the whole unified pool, and even a quantized fit would evict everything
+    else and crawl on MPS. Rendering it remotely both unlocks the larger model
+    and frees the local pool to keep working while frames render.
+
+    The endpoint contract is deliberately provider-agnostic REST:
+
+    * ``POST {endpoint}/jobs`` -> ``{"job_id": ..., "status": ...}``
+    * ``GET  {endpoint}/jobs/{job_id}`` -> ``{"status", "progress",
+      "output_url", "cost_usd", "error"}``
+    * ``POST {endpoint}/jobs/{job_id}/cancel``
+
+    Anything speaking that shape works; adapt a provider that does not by
+    supplying a custom transport to :class:`~akio_studio.cloud_video.CloudVideoRenderer`.
+    """
+
+    #: Base URL of the render API. Overridden by ``endpoint_env_var``.
+    endpoint: str = ""
+    #: Remote checkpoint — a 14B-class model the local machine cannot hold.
+    model: str = "wan2.2-t2v-a14b"
+    #: The bearer token is read from the environment, never stored in config
+    #: or written to logs, metadata, or the DPO record.
+    token_env_var: str = "AKIO_CLOUD_VIDEO_TOKEN"
+    endpoint_env_var: str = "AKIO_CLOUD_VIDEO_ENDPOINT"
+
+    submit_timeout_s: float = 60.0
+    poll_timeout_s: float = 30.0
+    download_timeout_s: float = 900.0
+    #: Poll backoff: starts at ``poll_interval_s``, grows to the max. GPU jobs
+    #: take minutes, so a tight poll loop is pure request waste.
+    poll_interval_s: float = 5.0
+    poll_interval_max_s: float = 30.0
+    #: Hard wall-clock budget per job. On expiry the job is CANCELED remotely
+    #: rather than abandoned — an orphaned GPU job keeps billing.
+    max_wait_s: float = 3600.0
+    #: Network retry attempts for idempotent requests.
+    max_attempts: int = 4
+    #: Refuse/cancel a job whose reported cost exceeds this. None disables.
+    max_cost_usd: float | None = 5.0
+    #: Cloud jobs run in parallel — this is remote capacity, not local memory.
+    max_concurrent_jobs: int = 3
+
+    def resolve_endpoint(self) -> str:
+        """Effective endpoint: environment override wins over the config value."""
+        return os.environ.get(self.endpoint_env_var, "") or self.endpoint
+
+    def resolve_token(self) -> str | None:
+        """Bearer token from the environment, or ``None`` when unset."""
+        return os.environ.get(self.token_env_var) or None
+
+    @property
+    def is_configured(self) -> bool:
+        """True when both an endpoint and a credential are available."""
+        return bool(self.resolve_endpoint()) and bool(self.resolve_token())
+
+
+@dataclass(frozen=True)
 class StudioConfig:
     """Top-level configuration object shared by every module."""
 
@@ -174,11 +242,33 @@ class StudioConfig:
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     comfyui: ComfyUIConfig = field(default_factory=ComfyUIConfig)
     quality_gate: ComfyQualityGate = field(default_factory=ComfyQualityGate)
+    cloud_video: CloudVideoConfig = field(default_factory=CloudVideoConfig)
     short_form_duration_s: float = 15.0
     #: Real, budgetable checkpoints — the spec's "WAN 2.7"/"Anima-Aesthetic"
     #: pins are unverifiable, so model identity is configuration, not code.
     image_model_id: str = "illustrious-xl-anime"
-    video_model_id: str = "wan2.1-t2v-1.3b"
+    #: ``"cloud"`` renders video on a remote GPU (default); ``"local"`` falls
+    #: back to a small on-device checkpoint that fits the unified pool.
+    video_backend: str = "cloud"
+    #: Small enough to run on-device when ``video_backend == "local"``.
+    local_video_model_id: str = "wan2.1-t2v-1.3b"
+
+    def __post_init__(self) -> None:
+        """Validate the backend selector."""
+        if self.video_backend not in ("cloud", "local"):
+            raise ValueError(
+                f"video_backend must be 'cloud' or 'local', got {self.video_backend!r}"
+            )
+
+    @property
+    def video_is_remote(self) -> bool:
+        """True when the video stage renders off-device."""
+        return self.video_backend == "cloud"
+
+    @property
+    def video_model_id(self) -> str:
+        """The checkpoint the video stage actually uses on this backend."""
+        return self.cloud_video.model if self.video_is_remote else self.local_video_model_id
 
     @property
     def usable_memory_gib(self) -> float:

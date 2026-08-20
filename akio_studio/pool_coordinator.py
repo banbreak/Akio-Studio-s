@@ -23,6 +23,10 @@ Corrected semantics baked in from the architecture audit:
 * **A4** — DPO pairs are only formed between renders sharing an identical
   ``prompt_hash`` (identical conditioning); cross-prompt pairs would teach a
   confounded preference and are never emitted.
+* **A10** — the video stage renders on a cloud GPU
+  (:mod:`akio_studio.cloud_video`). Because it holds no local weights it is
+  exempt from residency: local stages keep running while frames render
+  remotely, instead of being evicted for a model that never fitted anyway.
 """
 
 from __future__ import annotations
@@ -74,11 +78,13 @@ _PURGE_VERIFY_SLEEP_S = 0.5
 
 
 class Stage(enum.Enum):
-    """A mutually exclusive residency stage of the local model pool.
+    """A residency stage of the local model pool.
 
-    Footprints come from :data:`akio_studio.config.MODEL_FOOTPRINTS_GIB`;
-    on the target machine no two heavy stages fit together, so the coordinator
-    treats residency as exclusive (audit A1/M2).
+    Footprints come from :data:`akio_studio.config.MODEL_FOOTPRINTS_GIB`; on
+    the target machine no two heavy local stages fit together, so the
+    coordinator treats *local* residency as exclusive (audit A1/M2).
+    :attr:`VIDEO_DIFFUSION` is the exception when ``video_backend == "cloud"``
+    — it runs off-device and so never evicts a local stage (audit A10).
     """
 
     LLM = "llm"
@@ -462,9 +468,34 @@ class LocalPoolCoordinator:
         async with self._lock:
             await self._acquire_locked(stage)
 
+    def _is_remote(self, stage: Stage) -> bool:
+        """True when ``stage`` executes off-device and holds no local memory.
+
+        The video stage renders on a cloud GPU by default: it keeps only an
+        HTTP client resident, so it must NOT evict the LLM or image stack —
+        letting local work continue while frames render remotely is the whole
+        point of moving it off the machine.
+        """
+        return stage is Stage.VIDEO_DIFFUSION and self._config.video_is_remote
+
+    def _footprint_for(self, stage: Stage) -> float:
+        """Local footprint of ``stage`` on the active backend."""
+        if self._is_remote(stage):
+            return MODEL_FOOTPRINTS_GIB["video_client"]
+        return stage.footprint_gib
+
     async def _acquire_locked(self, stage: Stage) -> None:
         """Budget-gate and make ``stage`` resident; caller holds the lock."""
-        footprint = stage.footprint_gib
+        if self._is_remote(stage):
+            logger.info(
+                "stage %r runs remotely (~%s GiB local); local residency "
+                "unchanged (%s)",
+                stage.value,
+                self._footprint_for(stage),
+                self._resident.value if self._resident else "idle",
+            )
+            return
+        footprint = self._footprint_for(stage)
         usable = self._config.usable_memory_gib
         if footprint > usable:
             raise MemoryBudgetExceededError(
@@ -500,10 +531,20 @@ class LocalPoolCoordinator:
     async def stage(self, stage: Stage) -> AsyncIterator[None]:
         """``async with coordinator.stage(Stage.LLM):`` acquire/release scope.
 
-        The coordinator lock is held for the *entire* scope, so a concurrent
-        task cannot auto-evict this stage's engine mid-generation; concurrent
-        ``stage()`` users serialize instead.
+        For local stages the coordinator lock is held for the *entire* scope,
+        so a concurrent task cannot auto-evict this stage's engine
+        mid-generation; concurrent ``stage()`` users serialize instead.
+
+        A remote stage (cloud video) takes no lock and no residency: local
+        work proceeds in parallel while the GPU renders.
         """
+        if self._is_remote(stage):
+            await self._acquire_locked(stage)
+            try:
+                yield
+            finally:
+                await self._release_locked(stage)
+            return
         async with self._lock:
             await self._acquire_locked(stage)
             try:
@@ -524,6 +565,11 @@ class LocalPoolCoordinator:
         An unreachable engine holds nothing and counts as released.
         """
         released_ok = True
+        if self._is_remote(stage):
+            logger.debug(
+                "stage %r is remote; nothing local to purge on release", stage.value
+            )
+            return True
         if stage is Stage.LLM:
             status, verified = await self._purge_ollama()
             if status == "unloaded" and not verified:
