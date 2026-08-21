@@ -3,6 +3,7 @@
 
 Usage::
 
+    python scripts/runpod_setup.py --set-gpu-rate 0.89   # your real USD/hour
     python scripts/runpod_setup.py --check          # config + /health probe
     python scripts/runpod_setup.py --smoke          # + one real 33-frame render
     python scripts/runpod_setup.py --write-env-file # write cloud.env (chmod 600)
@@ -70,20 +71,34 @@ def check_config(config: StudioConfig) -> bool:
 
     print(f"[{OK}] provider         {cloud.provider}")
     print(f"[{OK}] model            {cloud.model}")
-    if cloud.runpod_gpu_cost_per_hour:
-        per_min = cloud.runpod_gpu_cost_per_hour / 60
-        print(
-            f"[{OK}] gpu rate         ${cloud.runpod_gpu_cost_per_hour:.2f}/hr "
-            f"(${per_min:.4f}/min) — used for the cost ceiling"
-        )
-    else:
-        print(
-            f"[{WARN}] gpu rate        0 — max_cost_usd cannot trip; "
-            "set runpod_gpu_cost_per_hour"
-        )
+    rate = cloud.resolve_gpu_cost_per_hour()
     ceiling = cloud.max_cost_usd
-    ceiling_text = f"${ceiling:.2f}" if ceiling else "disabled"
-    print(f"[{OK}] cost ceiling     {ceiling_text} per job")
+    if rate:
+        source = (
+            f"${cloud.runpod_gpu_rate_env_var}"
+            if os.environ.get(cloud.runpod_gpu_rate_env_var)
+            else "config"
+        )
+        print(
+            f"[{OK}] gpu rate         ${rate:.4f}/hr (${rate / 60:.4f}/min) "
+            f"from {source}"
+        )
+        if ceiling:
+            minutes = ceiling / (rate / 60)
+            print(
+                f"[{OK}] cost ceiling     ${ceiling:.2f} per job "
+                f"≈ {minutes:.0f} GPU-minutes before a job is cancelled"
+            )
+    else:
+        ok = False
+        print(f"[{BAD}] gpu rate         UNSET — cost tracking and the ceiling are inert")
+        print("       RunPod reports milliseconds, not dollars, so without your")
+        print("       actual rate a runaway job cannot be cancelled on cost.")
+        print("       Fix: python scripts/runpod_setup.py --set-gpu-rate <USD/hr>")
+        print("       Find it on the endpoint's page in the RunPod console")
+        print("       (flex and active workers bill at different rates).")
+        if ceiling:
+            print(f"[{WARN}] cost ceiling    ${ceiling:.2f} configured but UNENFORCEABLE")
     print(f"[{OK}] wall-clock cap   {cloud.max_wait_s:.0f}s per job")
     return ok
 
@@ -116,8 +131,9 @@ async def smoke_test(config: StudioConfig, assume_yes: bool) -> bool:
     """Submit one small real render to prove the whole path works."""
     print("\nSmoke test")
     cloud = config.cloud_video
-    estimate = (cloud.runpod_gpu_cost_per_hour or 0) * (90 / 3600)
-    print(f"  This starts a REAL render (~33 frames). Rough cost: ${estimate:.3f}.")
+    rate = cloud.resolve_gpu_cost_per_hour()
+    estimate = f"${rate * (90 / 3600):.3f}" if rate else "unknown (no gpu rate set)"
+    print(f"  This starts a REAL render (~33 frames). Rough cost: {estimate}.")
     if not assume_yes:
         reply = input("  Proceed? [y/N] ").strip().lower()
         if reply not in ("y", "yes"):
@@ -156,8 +172,64 @@ async def smoke_test(config: StudioConfig, assume_yes: bool) -> bool:
     return True
 
 
+def _env_file_path() -> Path:
+    """Where the launcher looks for credentials and per-machine settings."""
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "AkioStudio" / "cloud.env"
+    return Path.home() / ".akio_studio" / "cloud.env"
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    """Parse an existing cloud.env into a dict (comments and blanks ignored)."""
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        values[key.strip()] = value.strip()
+    return values
+
+
+def _write_env_file(path: Path, values: dict[str, str]) -> None:
+    """Write cloud.env with 0600 permissions from the moment of creation."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write("# Akio Studio cloud video settings — keep chmod 600.\n")
+        handle.write("# Sourced by the macOS launcher; outside the signed .app bundle.\n")
+        for key in sorted(values):
+            handle.write(f"{key}={values[key]}\n")
+
+
+def set_gpu_rate(config: StudioConfig, rate: float) -> bool:
+    """Persist the endpoint's real USD/hour rate to cloud.env."""
+    if rate <= 0:
+        print(f"[{BAD}] rate must be greater than 0 (got {rate})")
+        return False
+    cloud = config.cloud_video
+    path = _env_file_path()
+    values = _read_env_file(path)
+    values[cloud.runpod_gpu_rate_env_var] = f"{rate:g}"
+    _write_env_file(path, values)
+
+    print(f"[{OK}] gpu rate set to ${rate:.4f}/hr (${rate / 60:.4f}/min)")
+    print(f"[{OK}] written to {path} (mode {oct(path.stat().st_mode & 0o777)})")
+    ceiling = cloud.max_cost_usd
+    if ceiling:
+        print(
+            f"[{OK}] the ${ceiling:.2f} ceiling now cancels a job after about "
+            f"{ceiling / (rate / 60):.0f} GPU-minutes"
+        )
+    print("\n  Active in this shell:")
+    print(f"    export {cloud.runpod_gpu_rate_env_var}={rate:g}")
+    return True
+
+
 def write_env_file(config: StudioConfig) -> bool:
-    """Write the launcher's ``cloud.env`` with 0600 permissions."""
+    """Write credentials (and any known rate) to the launcher's cloud.env."""
     cloud = config.cloud_video
     endpoint_id = cloud.resolve_runpod_endpoint_id()
     token = cloud.resolve_token() or os.environ.get("RUNPOD_API_KEY", "")
@@ -165,20 +237,18 @@ def write_env_file(config: StudioConfig) -> bool:
         print(f"[{BAD}] both endpoint id and api key must be set in the environment first")
         return False
 
-    if sys.platform == "darwin":
-        target = Path.home() / "Library" / "Application Support" / "AkioStudio" / "cloud.env"
-    else:
-        target = Path.home() / ".akio_studio" / "cloud.env"
-    target.parent.mkdir(parents=True, exist_ok=True)
+    path = _env_file_path()
+    values = _read_env_file(path)
+    values["AKIO_RUNPOD_ENDPOINT_ID"] = endpoint_id
+    values["RUNPOD_API_KEY"] = token
+    rate = cloud.resolve_gpu_cost_per_hour()
+    if rate:
+        values[cloud.runpod_gpu_rate_env_var] = f"{rate:g}"
+    _write_env_file(path, values)
 
-    # Create with restrictive permissions from the start — never world-readable,
-    # not even briefly.
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write("# Akio Studio cloud video credentials — keep chmod 600.\n")
-        handle.write(f"AKIO_RUNPOD_ENDPOINT_ID={endpoint_id}\n")
-        handle.write(f"RUNPOD_API_KEY={token}\n")
-    print(f"[{OK}] wrote {target} (mode {oct(target.stat().st_mode & 0o777)})")
+    print(f"[{OK}] wrote {path} (mode {oct(path.stat().st_mode & 0o777)})")
+    if not rate:
+        print(f"[{WARN}] no gpu rate stored — run --set-gpu-rate <USD/hr>")
     print("      The macOS launcher sources this on start; it is outside the")
     print("      signed .app bundle, so the credential is never distributed.")
     return True
@@ -214,6 +284,8 @@ async def main_async(args: argparse.Namespace) -> int:
     config = StudioConfig()
     print("Akio Studio — RunPod endpoint setup\n" + "=" * 44)
 
+    if args.set_gpu_rate is not None:
+        return 0 if set_gpu_rate(config, args.set_gpu_rate) else 1
     if args.write_env_file:
         return 0 if write_env_file(config) else 1
     if args.reconcile:
@@ -239,6 +311,12 @@ def main() -> int:
         "--smoke", action="store_true", help="also run one real render (costs money)"
     )
     parser.add_argument("--yes", action="store_true", help="skip the smoke-test confirmation")
+    parser.add_argument(
+        "--set-gpu-rate",
+        type=float,
+        metavar="USD_PER_HOUR",
+        help="persist the endpoint's real hourly rate (enables the cost ceiling)",
+    )
     parser.add_argument(
         "--write-env-file", action="store_true", help="write cloud.env (chmod 600)"
     )

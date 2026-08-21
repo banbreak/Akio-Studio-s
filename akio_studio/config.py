@@ -9,6 +9,7 @@ limits.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -17,6 +18,8 @@ from pathlib import Path
 #: Master timeline rate. 23.976 fps is exactly 24000/1001 — using the rounded
 #: float drifts by one frame roughly every 1000 seconds, which is enough to
 #: mis-attribute a retention drop-off to a neighbouring frame in DPO logging.
+logger = logging.getLogger(__name__)
+
 MASTER_FPS: Fraction = Fraction(24000, 1001)
 
 #: Total unified memory on the target machine, in GiB.
@@ -226,9 +229,20 @@ class CloudVideoConfig:
     runpod_endpoint_id: str = ""
     runpod_endpoint_id_env_var: str = "AKIO_RUNPOD_ENDPOINT_ID"
     #: USD/hour for the endpoint's GPU. RunPod reports milliseconds, not
-    #: dollars, so without a rate the ``max_cost_usd`` ceiling cannot trip.
-    #: Default is an A40/L40S-class list price; set it to your actual rate.
-    runpod_gpu_cost_per_hour: float = 0.79
+    #: dollars, so every derived cost — and therefore the ``max_cost_usd``
+    #: ceiling — is only as accurate as this number.
+    #:
+    #: There is deliberately **no default price**: a plausible-looking wrong
+    #: rate would silently protect you at the wrong threshold, which is worse
+    #: than no protection at all. ``0.0`` means "cost unknown", which reports
+    #: no cost and disables the ceiling *visibly* (the setup script warns).
+    #: Find your rate on the endpoint's page in the RunPod console, or on the
+    #: serverless pricing page for the GPU class you selected. Note that
+    #: flex (scale-to-zero) and active workers bill at different rates.
+    runpod_gpu_cost_per_hour: float = 0.0
+    #: Environment override, so the rate can be set per machine without a
+    #: code change (the launcher's cloud.env is a good home for it).
+    runpod_gpu_rate_env_var: str = "AKIO_RUNPOD_GPU_RATE_USD_PER_HOUR"
 
     def resolve_endpoint(self) -> str:
         """Effective endpoint: environment override wins over the config value."""
@@ -237,6 +251,30 @@ class CloudVideoConfig:
     def resolve_token(self) -> str | None:
         """Bearer token from the environment, or ``None`` when unset."""
         return os.environ.get(self.token_env_var) or None
+
+    def resolve_gpu_cost_per_hour(self) -> float:
+        """Effective USD/hour: environment override wins over the config value.
+
+        A malformed override is ignored with a warning rather than crashing a
+        render — but it falls back to the configured value, never to a guess.
+        """
+        raw = os.environ.get(self.runpod_gpu_rate_env_var, "").strip()
+        if raw:
+            try:
+                rate = float(raw)
+            except ValueError:
+                logger.warning(
+                    "ignoring malformed $%s=%r; expected a number like 0.89",
+                    self.runpod_gpu_rate_env_var,
+                    raw,
+                )
+            else:
+                if rate >= 0:
+                    return rate
+                logger.warning(
+                    "ignoring negative $%s=%r", self.runpod_gpu_rate_env_var, raw
+                )
+        return self.runpod_gpu_cost_per_hour
 
     def resolve_runpod_endpoint_id(self) -> str:
         """RunPod endpoint id from the environment, else the config value."""

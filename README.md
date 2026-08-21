@@ -114,9 +114,23 @@ export AKIO_RUNPOD_ENDPOINT_ID="<id from the endpoint page>"
 export RUNPOD_API_KEY="<Settings → API Keys>"
 ```
 
-Set `runpod_gpu_cost_per_hour` in `CloudVideoConfig` to the rate you are
-actually paying — RunPod reports milliseconds, not dollars, so the cost
-ceiling is derived from that rate and cannot protect you if it is wrong.
+Then set the rate you are **actually** paying:
+
+```bash
+python scripts/runpod_setup.py --set-gpu-rate 0.89   # your endpoint's USD/hour
+```
+
+There is no default price on purpose. RunPod reports milliseconds, not
+dollars, so every cost figure — and the `max_cost_usd` ceiling — is derived
+from this number; a plausible-looking wrong rate would silently guard at the
+wrong threshold, which is worse than no guard. Unset, cost tracking reports
+nothing and `--check` fails loudly rather than pretending to protect you.
+
+Find the rate on the endpoint's page in the RunPod console. Flex
+(scale-to-zero) and active workers bill at different rates — use the one your
+endpoint actually runs. `--set-gpu-rate` stores it in `cloud.env` (chmod 600),
+which the macOS launcher sources; `$AKIO_RUNPOD_GPU_RATE_USD_PER_HOUR`
+overrides it per shell.
 
 **4. Verify**
 

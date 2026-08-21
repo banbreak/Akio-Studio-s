@@ -227,3 +227,39 @@ async def test_health_check(tmp_path, monkeypatch) -> None:
         _cfg(), journal_path=tmp_path / "j.jsonl", http=FakeRunPodAPI()
     )
     assert (await transport.health())["workers"]["ready"] == 1
+
+
+# ------------------------------------------------------------- gpu rate
+
+
+def test_gpu_rate_has_no_fabricated_default() -> None:
+    """A plausible-but-wrong default would guard at the wrong threshold."""
+    assert CloudVideoConfig().resolve_gpu_cost_per_hour() == 0.0
+
+
+def test_gpu_rate_env_override(monkeypatch) -> None:
+    cfg = CloudVideoConfig(runpod_gpu_cost_per_hour=0.5)
+    monkeypatch.setenv("AKIO_RUNPOD_GPU_RATE_USD_PER_HOUR", "1.19")
+    assert cfg.resolve_gpu_cost_per_hour() == 1.19
+
+
+def test_malformed_gpu_rate_falls_back_never_guesses(monkeypatch) -> None:
+    cfg = CloudVideoConfig(runpod_gpu_cost_per_hour=0.5)
+    monkeypatch.setenv("AKIO_RUNPOD_GPU_RATE_USD_PER_HOUR", "not-a-number")
+    assert cfg.resolve_gpu_cost_per_hour() == 0.5
+    monkeypatch.setenv("AKIO_RUNPOD_GPU_RATE_USD_PER_HOUR", "-3")
+    assert cfg.resolve_gpu_cost_per_hour() == 0.5
+
+
+async def test_env_rate_drives_derived_cost(tmp_path, monkeypatch) -> None:
+    """The rate the operator sets is the rate the ceiling actually uses."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-secret")
+    monkeypatch.setenv("AKIO_RUNPOD_GPU_RATE_USD_PER_HOUR", "3.6")  # $0.001/s
+    api = FakeRunPodAPI(
+        output={"video_base64": base64.b64encode(b"MP4").decode()},
+        execution_ms=10_000,
+    )
+    result = await _renderer(
+        api, tmp_path, runpod_gpu_cost_per_hour=0.0
+    ).render_shot(_request(), tmp_path)
+    assert result.cost_usd == pytest.approx(0.0105, abs=1e-4)

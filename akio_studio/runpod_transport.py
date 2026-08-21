@@ -318,7 +318,7 @@ class RunPodTransport:
         RunPod bills GPU-seconds and reports no cost field, so without this the
         renderer's ``max_cost_usd`` ceiling could never trip on RunPod.
         """
-        rate_per_hour = self._config.runpod_gpu_cost_per_hour
+        rate_per_hour = self._config.resolve_gpu_cost_per_hour()
         if not rate_per_hour:
             return None
         execution_ms = body.get("executionTime")
